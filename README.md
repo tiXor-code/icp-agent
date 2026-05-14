@@ -85,7 +85,7 @@ curl https://icp-agent-ten.vercel.app/api/health
 ```
 
 Total: **2 enrichment calls (parallel) + 1-3 LLM assess calls + 1 LLM score call + 1 LLM email call**.
-Anthropic prompt caching keeps the ICP system prompt free across calls.
+All LLM calls go through **Azure OpenAI gpt-4o-mini**; Azure's automatic prompt caching engages on inputs over 1024 tokens, so the ICP system prompt is cached after the first call at no extra effort.
 
 ---
 
@@ -153,7 +153,7 @@ Action menu:
 - **Bounded**: `MAX_DEEPEN_ROUNDS = 2` (configurable via env). Total LLM calls per lead ≤ 4 (3 assess + 1 score + 1 email).
 - **Closed action set**: Zod-validated. The LLM cannot invent new tool names.
 - **No infinite-tool-loop**: if a previous tool returned an error, the prompt instructs the LLM to pick a different one (and a test confirms warnings get logged).
-- **Cache cost**: the ICP system prompt is sent with `cache_control: { type: 'ephemeral' }` — reused across the 3-5 LLM calls per lead for free after the first one.
+- **Cache cost**: Azure OpenAI's automatic prompt caching kicks in once the system prompt crosses 1024 tokens (it does), so the ICP constitution is cached across the 3-5 LLM calls per lead at no per-call cost after the first.
 
 ### Why ReAct over free-form tool-use
 
@@ -203,7 +203,7 @@ The website scrape uses **plain `fetch` + cheerio** — no external API, no rate
 | Hunter 429 / 401 / 5xx | Empty `HunterCompany` with `error: 'rate_limited'`. Logged as warning. Agent's assess prompt is told to compensate via LinkedIn lookup. |
 | Hunter returns 0 emails | Valid empty input — LLM marks confidence `low` and likely picks `fetch_email_finder` or `fetch_linkedin`. |
 | Website unreachable (timeout, 4xx, 5xx) | `ScrapeResult { error, partial: {} }`. Agent continues; will likely deepen. |
-| Anthropic 5xx | One retry with backoff. Second failure → `status: failed`, partial context retained in Sheet. |
+| Azure OpenAI 5xx / 429 | One retry with backoff. Second failure → `status: failed`, partial context retained in Sheet. |
 | LLM returns malformed JSON | Zod fails → 1 repair retry with the previous response shown. Second failure → `status: failed`. |
 | Google Sheets API down | Buffered to local JSONL. Append + update both fall back. Sheet flush is a documented manual recovery step. |
 | Vercel function killed mid-run | Row stays at `status: processing`. This is a known limitation of `waitUntil` on Hobby plan (60s ceiling). Production fix: Vercel Workflow DevKit. |
@@ -246,7 +246,7 @@ R  token_usage_json             per-LLM-call usage incl. cache stats
 ```
 POST /api/webhook/inbound        { email, domain, source? } → 202 { lead_id, sheet_row_url }
 GET  /api/leads/:id              → { ...row, status }  or 404
-GET  /api/health                 → { ok, deps: { anthropic, hunter, serpapi, sheets } }
+GET  /api/health                 → { ok, deps: { azure_openai, hunter, serpapi, sheets } }
 ```
 
 ---
@@ -276,7 +276,7 @@ icp-agent/
 │   │   ├── run.ts                     ← orchestrator (ReAct loop)
 │   │   ├── icp.ts                     ← ICP criteria source of truth
 │   │   ├── schemas.ts                 ← Zod schemas for LLM outputs
-│   │   ├── llm.ts                     ← Anthropic wrapper w/ caching + repair retry
+│   │   ├── llm.ts                     ← Azure OpenAI wrapper w/ JSON-mode + Zod + repair retry
 │   │   ├── prompts.ts                 ← compiled prompt loader
 │   │   └── tools/
 │   │       ├── scrape.ts              ← fetch + cheerio
@@ -305,12 +305,14 @@ icp-agent/
 ```bash
 vercel link
 # Set each env var (interactive):
-vercel env add ANTHROPIC_API_KEY production
+vercel env add AZURE_OPENAI_ENDPOINT production
+vercel env add AZURE_OPENAI_API_KEY production
+vercel env add AZURE_OPENAI_DEPLOYMENT production       # gpt-4o-mini
+vercel env add AZURE_OPENAI_API_VERSION production      # 2024-10-21
 vercel env add HUNTER_API_KEY production
 vercel env add SERPAPI_API_KEY production
 vercel env add GOOGLE_SHEETS_ID production
 vercel env add GOOGLE_SERVICE_ACCOUNT_JSON production   # base64-encoded JSON key
-vercel env add LLM_MODEL production                     # claude-sonnet-4-6
 vercel env add MAX_DEEPEN_ROUNDS production             # 2
 # Optional:
 vercel env add WEBHOOK_SECRET production
