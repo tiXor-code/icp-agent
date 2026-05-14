@@ -166,6 +166,27 @@ The trade-off: less expressive, but far more defensible.
 
 ---
 
+## How Anthropic auth works in production
+
+The live URL deploys to Vercel, which can't read macOS Keychain. So instead of paying for a separate `sk-ant-...` API key, the production stack uses the **Claude Code subscription** via a small self-hosted proxy:
+
+```
+Vercel function
+   │ Anthropic SDK { baseURL: https://claude.teodorlutoiu.com, header: x-proxy-secret }
+   ▼
+Cloudflare Tunnel
+   ▼
+Mac-mini :18800  ──>  reads OAuth token from macOS Keychain
+                      forwards request to api.anthropic.com with Bearer auth
+```
+
+`src/agent/llm.ts` resolves auth in this priority order:
+1. **Proxy** — `ANTHROPIC_BASE_URL` + `ANTHROPIC_PROXY_SECRET` set → use those (works on Vercel)
+2. **API key** — `ANTHROPIC_API_KEY` set with `sk-ant-...` (standard fallback)
+3. **Local Keychain** — macOS-only, for local dev without setting any env
+
+For reviewers running this repo locally, option 3 (Keychain) is automatic if they have Claude Code CLI logged in. Otherwise, set `ANTHROPIC_API_KEY` in `.env`.
+
 ## External APIs
 
 | API | Purpose | Free tier | Failure handling |
