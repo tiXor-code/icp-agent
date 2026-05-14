@@ -253,7 +253,7 @@ icp-agent/
 │   ├── payload.json
 │   ├── payload-rich.json
 │   └── payload-sparse.json
-├── api/index.ts                       ← Vercel entry (wraps Hono via hono/vercel handle())
+├── (Vercel auto-detects Hono preset and deploys src/index.ts)
 ├── src/
 │   ├── server.ts                      ← local dev entry
 │   ├── index.ts                       ← Hono app composition
