@@ -1,4 +1,5 @@
 import Anthropic from '@anthropic-ai/sdk';
+import { execFileSync } from 'node:child_process';
 import { z } from 'zod';
 import { getEnv } from '../lib/env.js';
 import { log } from '../lib/log.js';
@@ -9,11 +10,39 @@ import type { AssessOutput, ScoreOutput, EmailOutput } from './schemas.js';
 
 let client: Anthropic | null = null;
 
+function readKeychainOAuthToken(): string | null {
+  if (process.platform !== 'darwin') return null;
+  try {
+    const out = execFileSync('security', ['find-generic-password', '-s', 'Claude Code-credentials', '-w'], {
+      encoding: 'utf8',
+    });
+    const parsed = JSON.parse(out.trim());
+    return parsed?.claudeAiOauth?.accessToken ?? null;
+  } catch {
+    return null;
+  }
+}
+
 function getClient(): Anthropic {
   if (client) return client;
   const env = getEnv();
-  client = new Anthropic({ apiKey: env.ANTHROPIC_API_KEY });
-  return client;
+  if (env.ANTHROPIC_API_KEY && env.ANTHROPIC_API_KEY.startsWith('sk-ant-')) {
+    log().info('anthropic_auth_api_key');
+    client = new Anthropic({ apiKey: env.ANTHROPIC_API_KEY });
+    return client;
+  }
+  const oauth = readKeychainOAuthToken();
+  if (oauth) {
+    log().info('anthropic_auth_oauth_keychain');
+    client = new Anthropic({
+      authToken: oauth,
+      defaultHeaders: { 'anthropic-beta': 'oauth-2025-04-20' },
+    });
+    return client;
+  }
+  throw new Error(
+    'No Anthropic auth available. Set ANTHROPIC_API_KEY (sk-ant-...) or run `claude` CLI login on macOS to use the subscription.',
+  );
 }
 
 interface LlmCallResult<T> {
