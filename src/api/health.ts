@@ -8,16 +8,13 @@ app.get('/', (c) => {
   return c.json({
     ok: true,
     deps: {
-      anthropic: env.ANTHROPIC_BASE_URL && env.ANTHROPIC_PROXY_SECRET
-        ? 'proxy'
-        : env.ANTHROPIC_API_KEY
-          ? 'api_key'
-          : (process.platform === 'darwin' ? 'oauth_keychain_maybe' : 'missing'),
+      azure_openai: env.AZURE_OPENAI_ENDPOINT && env.AZURE_OPENAI_API_KEY ? 'configured' : 'missing',
       hunter: env.HUNTER_API_KEY ? 'configured' : 'missing',
       serpapi: env.SERPAPI_API_KEY ? 'configured' : 'missing',
       sheets: env.GOOGLE_SHEETS_ID && env.GOOGLE_SERVICE_ACCOUNT_JSON ? 'configured' : 'missing',
     },
-    model: env.LLM_MODEL,
+    deployment: env.AZURE_OPENAI_DEPLOYMENT,
+    api_version: env.AZURE_OPENAI_API_VERSION,
     max_deepen_rounds: env.MAX_DEEPEN_ROUNDS,
   });
 });

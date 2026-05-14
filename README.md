@@ -2,7 +2,7 @@
 
 An autonomous lead-engagement agent. Receives `{email, domain}` webhooks, enriches the lead, **decides whether to research more**, scores against an ICP, routes into Hot / Warm / Cold sequences, and drafts a personalized opening email. Every decision is logged to a Google Sheet.
 
-Built with TypeScript + [Hono](https://hono.dev) + the Anthropic SDK (`claude-sonnet-4-6`) + Hunter.io + SerpAPI. Deployable to Vercel; runs locally with one command.
+Built with TypeScript + [Hono](https://hono.dev) + Azure OpenAI (`gpt-4o-mini`) + Hunter.io + SerpAPI. Deployable to Vercel; runs locally with one command.
 
 ---
 
@@ -166,32 +166,25 @@ The trade-off: less expressive, but far more defensible.
 
 ---
 
-## How Anthropic auth works in production
+## LLM provider — Azure OpenAI
 
-The live URL deploys to Vercel, which can't read macOS Keychain. So instead of paying for a separate `sk-ant-...` API key, the production stack uses the **Claude Code subscription** via a small self-hosted proxy:
+The agent uses **Azure OpenAI** (`gpt-4o-mini` deployment, API version `2024-10-21`) via the OpenAI SDK pointed at an Azure endpoint. Three calls per lead: `assess`, `score`, `email`. JSON outputs enforced via `response_format: { type: 'json_object' }` plus Zod validation with a 1-shot repair retry.
 
+Required env (Vercel + local `.env`):
 ```
-Vercel function
-   │ Anthropic SDK { baseURL: https://claude.teodorlutoiu.com, header: x-proxy-secret }
-   ▼
-Cloudflare Tunnel
-   ▼
-Mac-mini :18800  ──>  reads OAuth token from macOS Keychain
-                      forwards request to api.anthropic.com with Bearer auth
+AZURE_OPENAI_ENDPOINT=https://<resource>.openai.azure.com/
+AZURE_OPENAI_API_KEY=<key>
+AZURE_OPENAI_DEPLOYMENT=gpt-4o-mini
+AZURE_OPENAI_API_VERSION=2024-10-21
 ```
 
-`src/agent/llm.ts` resolves auth in this priority order:
-1. **Proxy** — `ANTHROPIC_BASE_URL` + `ANTHROPIC_PROXY_SECRET` set → use those (works on Vercel)
-2. **API key** — `ANTHROPIC_API_KEY` set with `sk-ant-...` (standard fallback)
-3. **Local Keychain** — macOS-only, for local dev without setting any env
-
-For reviewers running this repo locally, option 3 (Keychain) is automatic if they have Claude Code CLI logged in. Otherwise, set `ANTHROPIC_API_KEY` in `.env`.
+Reviewers can swap `gpt-4o-mini` for `gpt-4o` or any deployed model by changing the deployment name. The prompts in `prompts/` are model-agnostic.
 
 ## External APIs
 
 | API | Purpose | Free tier | Failure handling |
 |---|---|---|---|
-| **Anthropic** (`claude-sonnet-4-6`) | Assess, score, email | Pay-as-you-go ($) | 1 retry with repair-prompt on malformed JSON; full failure → `status: failed`. |
+| **Azure OpenAI** (`gpt-4o-mini`) | Assess, score, email | Pay-as-you-go ($, very cheap) | 1 retry with repair-prompt on malformed JSON; full failure → `status: failed`. |
 | **Hunter.io** `domain-search` | Company firmographics + emails | 25/mo | 429 → recorded as `hunter:rate_limited`; agent likely picks `fetch_linkedin`. |
 | **Hunter.io** `email-finder` | Verify exec emails | 25/mo (shared) | Same as above. |
 | **SerpAPI** Google search | LinkedIn + news lookups | 100/mo | 429 → recorded as warning; loop forces `score_now`. |

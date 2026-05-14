@@ -1,10 +1,10 @@
 import { z } from 'zod';
 
 const EnvSchema = z.object({
-  ANTHROPIC_API_KEY: z.string().optional(),
-  ANTHROPIC_BASE_URL: z.string().url().optional(),
-  ANTHROPIC_PROXY_SECRET: z.string().optional(),
-  LLM_MODEL: z.string().default('claude-sonnet-4-6'),
+  AZURE_OPENAI_ENDPOINT: z.string().url().optional(),
+  AZURE_OPENAI_API_KEY: z.string().optional(),
+  AZURE_OPENAI_DEPLOYMENT: z.string().default('gpt-4o-mini'),
+  AZURE_OPENAI_API_VERSION: z.string().default('2024-10-21'),
   HUNTER_API_KEY: z.string().optional(),
   SERPAPI_API_KEY: z.string().optional(),
   GOOGLE_SHEETS_ID: z.string().optional(),

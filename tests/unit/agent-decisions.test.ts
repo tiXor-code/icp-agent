@@ -76,8 +76,10 @@ vi.mock('../../src/sinks/sheets.js', () => ({
 
 vi.mock('../../src/lib/env.js', () => ({
   getEnv: () => ({
-    ANTHROPIC_API_KEY: 'test',
-    LLM_MODEL: 'claude-sonnet-4-6',
+    AZURE_OPENAI_ENDPOINT: 'https://test.openai.azure.com/',
+    AZURE_OPENAI_API_KEY: 'test',
+    AZURE_OPENAI_DEPLOYMENT: 'gpt-4o-mini',
+    AZURE_OPENAI_API_VERSION: '2024-10-21',
     MAX_DEEPEN_ROUNDS: 2,
     LOG_LEVEL: 'fatal',
     NODE_ENV: 'test',
