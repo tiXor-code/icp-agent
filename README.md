@@ -30,15 +30,22 @@ Three seed payloads ship in `seed/`:
 
 ## Live demo
 
-> **Live URL**: _(filled in after first Vercel deploy)_
+> **Live URL**: https://icp-agent-ten.vercel.app
 >
-> **Decision log (Google Sheet)**: _(linked after first deploy)_
+> **Decision log (Google Sheet)**: pending org-policy unblock; falls back to local `/tmp/icp-agent-sheet-buffer.jsonl` until configured.
 
 POST a sample to the live URL:
 ```bash
-curl -X POST https://<your-deploy>.vercel.app/api/webhook/inbound \
+curl -X POST https://icp-agent-ten.vercel.app/api/webhook/inbound \
   -H "content-type: application/json" \
   -d '{"email":"founders@linear.app","domain":"linear.app"}'
+# → 202 { "lead_id": "...", "status": "processing", "sheet_row_url": ... }
+```
+
+Status check:
+```bash
+curl https://icp-agent-ten.vercel.app/api/leads/<lead_id>
+curl https://icp-agent-ten.vercel.app/api/health
 ```
 
 ---
@@ -246,7 +253,7 @@ icp-agent/
 │   ├── payload.json
 │   ├── payload-rich.json
 │   └── payload-sparse.json
-├── api/index.ts                       ← Vercel entry (wraps Hono)
+├── api/index.ts                       ← Vercel entry (wraps Hono via hono/vercel handle())
 ├── src/
 │   ├── server.ts                      ← local dev entry
 │   ├── index.ts                       ← Hono app composition
