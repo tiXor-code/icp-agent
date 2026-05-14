@@ -26,11 +26,26 @@ function readKeychainOAuthToken(): string | null {
 function getClient(): Anthropic {
   if (client) return client;
   const env = getEnv();
+
+  // 1. Mac-mini OAuth proxy — preferred when set (works on Vercel + locally).
+  if (env.ANTHROPIC_BASE_URL && env.ANTHROPIC_PROXY_SECRET) {
+    log().info({ baseURL: env.ANTHROPIC_BASE_URL }, 'anthropic_auth_proxy');
+    client = new Anthropic({
+      apiKey: 'proxy',
+      baseURL: env.ANTHROPIC_BASE_URL,
+      defaultHeaders: { 'x-proxy-secret': env.ANTHROPIC_PROXY_SECRET },
+    });
+    return client;
+  }
+
+  // 2. Direct Anthropic Console API key.
   if (env.ANTHROPIC_API_KEY && env.ANTHROPIC_API_KEY.startsWith('sk-ant-')) {
     log().info('anthropic_auth_api_key');
     client = new Anthropic({ apiKey: env.ANTHROPIC_API_KEY });
     return client;
   }
+
+  // 3. Local dev fallback — read OAuth from macOS Keychain.
   const oauth = readKeychainOAuthToken();
   if (oauth) {
     log().info('anthropic_auth_oauth_keychain');
@@ -40,8 +55,9 @@ function getClient(): Anthropic {
     });
     return client;
   }
+
   throw new Error(
-    'No Anthropic auth available. Set ANTHROPIC_API_KEY (sk-ant-...) or run `claude` CLI login on macOS to use the subscription.',
+    'No Anthropic auth available. Set ANTHROPIC_BASE_URL+ANTHROPIC_PROXY_SECRET (proxy), or ANTHROPIC_API_KEY (sk-ant-...), or run `claude` CLI login on macOS to use the subscription locally.',
   );
 }
 
