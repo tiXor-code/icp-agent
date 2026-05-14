@@ -1,7 +1,10 @@
-import { google } from 'googleapis';
+// Thin Google Sheets REST client — uses node:crypto for JWT signing + built-in fetch.
+// Avoids the `googleapis` SDK, which is huge (~30MB cold start on serverless).
+
 import { mkdir, appendFile, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { createSign } from 'node:crypto';
 import { getEnv } from '../lib/env.js';
 import { log } from '../lib/log.js';
 import type { AgentContext, LeadStatus, Sequence } from '../types.js';
@@ -50,31 +53,98 @@ export interface FinalRow {
   token_usage: Record<string, { in: number; out: number; cache_read?: number; cache_write?: number }>;
 }
 
-let sheetsClient: ReturnType<typeof google.sheets> | null = null;
+interface ServiceAccountCreds {
+  client_email: string;
+  private_key: string;
+}
+
+let creds: ServiceAccountCreds | null = null;
+let cachedToken: { token: string; exp: number } | null = null;
 
 function bufferPath(): string {
   return join(tmpdir(), 'icp-agent-sheet-buffer.jsonl');
 }
 
-function getSheets(): ReturnType<typeof google.sheets> | null {
-  if (sheetsClient) return sheetsClient;
+function isConfigured(): boolean {
   const env = getEnv();
-  if (!env.GOOGLE_SHEETS_ID || !env.GOOGLE_SERVICE_ACCOUNT_JSON) return null;
-  let creds: { client_email: string; private_key: string };
+  return !!(env.GOOGLE_SHEETS_ID && env.GOOGLE_SERVICE_ACCOUNT_JSON);
+}
+
+function loadCreds(): ServiceAccountCreds | null {
+  if (creds) return creds;
+  const env = getEnv();
+  if (!env.GOOGLE_SERVICE_ACCOUNT_JSON) return null;
   try {
     const raw = Buffer.from(env.GOOGLE_SERVICE_ACCOUNT_JSON, 'base64').toString('utf8');
-    creds = JSON.parse(raw);
+    const parsed = JSON.parse(raw);
+    if (!parsed.client_email || !parsed.private_key) return null;
+    creds = { client_email: parsed.client_email, private_key: parsed.private_key };
+    return creds;
   } catch (err) {
     log().error({ err }, 'sheets_creds_parse_failed');
     return null;
   }
-  const auth = new google.auth.JWT({
-    email: creds.client_email,
-    key: creds.private_key,
-    scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+}
+
+function base64url(input: Buffer | string): string {
+  return Buffer.from(input).toString('base64').replace(/=+$/, '').replace(/\+/g, '-').replace(/\//g, '_');
+}
+
+async function getAccessToken(): Promise<string | null> {
+  if (cachedToken && cachedToken.exp - 60 > Math.floor(Date.now() / 1000)) {
+    return cachedToken.token;
+  }
+  const c = loadCreds();
+  if (!c) return null;
+
+  const now = Math.floor(Date.now() / 1000);
+  const header = base64url(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
+  const payload = base64url(
+    JSON.stringify({
+      iss: c.client_email,
+      scope: 'https://www.googleapis.com/auth/spreadsheets',
+      aud: 'https://oauth2.googleapis.com/token',
+      iat: now,
+      exp: now + 3600,
+    }),
+  );
+  const signer = createSign('RSA-SHA256');
+  signer.update(`${header}.${payload}`);
+  const sig = base64url(signer.sign(c.private_key));
+  const assertion = `${header}.${payload}.${sig}`;
+
+  const res = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+      assertion,
+    }),
   });
-  sheetsClient = google.sheets({ version: 'v4', auth });
-  return sheetsClient;
+  if (!res.ok) {
+    log().warn({ status: res.status, body: await res.text() }, 'sheets_token_failed');
+    return null;
+  }
+  const json = (await res.json()) as { access_token: string; expires_in: number };
+  cachedToken = { token: json.access_token, exp: now + json.expires_in };
+  return cachedToken.token;
+}
+
+async function sheetsApi(method: 'GET' | 'POST' | 'PUT', path: string, body?: unknown): Promise<Response | null> {
+  const env = getEnv();
+  if (!env.GOOGLE_SHEETS_ID) return null;
+  const token = await getAccessToken();
+  if (!token) return null;
+  const url = `https://sheets.googleapis.com/v4/spreadsheets/${env.GOOGLE_SHEETS_ID}${path}`;
+  const res = await fetch(url, {
+    method,
+    headers: {
+      authorization: `Bearer ${token}`,
+      'content-type': 'application/json',
+    },
+    ...(body !== undefined && { body: JSON.stringify(body) }),
+  });
+  return res;
 }
 
 async function bufferToDisk(payload: object): Promise<void> {
@@ -87,64 +157,44 @@ async function bufferToDisk(payload: object): Promise<void> {
 }
 
 export async function ensureHeader(): Promise<void> {
-  const sheets = getSheets();
-  if (!sheets) return;
+  if (!isConfigured()) return;
   const env = getEnv();
   try {
-    const res = await sheets.spreadsheets.values.get({
-      spreadsheetId: env.GOOGLE_SHEETS_ID!,
-      range: `${env.GOOGLE_SHEETS_TAB}!A1:R1`,
-    });
-    const row = res.data.values?.[0];
-    if (!row || row.length === 0) {
-      await sheets.spreadsheets.values.update({
-        spreadsheetId: env.GOOGLE_SHEETS_ID!,
-        range: `${env.GOOGLE_SHEETS_TAB}!A1`,
-        valueInputOption: 'RAW',
-        requestBody: { values: [HEADER] },
-      });
+    const get = await sheetsApi('GET', `/values/${encodeURIComponent(env.GOOGLE_SHEETS_TAB)}!A1:R1`);
+    if (!get) return;
+    if (get.status === 200) {
+      const json = (await get.json()) as { values?: string[][] };
+      if (json.values && json.values[0] && json.values[0].length > 0) return;
     }
+    await sheetsApi(
+      'PUT',
+      `/values/${encodeURIComponent(env.GOOGLE_SHEETS_TAB)}!A1?valueInputOption=RAW`,
+      { values: [HEADER] },
+    );
   } catch (err) {
     log().warn({ err }, 'sheets_header_check_failed');
   }
 }
 
 export async function appendInitial(row: InitialRow): Promise<{ row_url: string | null }> {
-  const sheets = getSheets();
-  const env = getEnv();
-  const now = new Date().toISOString();
-  const values = [
-    now,
-    row.lead_id,
-    row.email,
-    row.domain,
-    'processing',
-    '', // sequence
-    '', // score
-    '', // reasoning
-    '', // breakdown
-    '', // enrichment summary
-    '', // deepen actions
-    '', // email subject
-    '', // email body
-    '', // raw_context
-    '', // warnings
-    '', // error_message
-    '', // duration
-    '', // token usage
-  ];
-  if (!sheets) {
-    await bufferToDisk({ kind: 'append', row: values });
+  if (!isConfigured()) {
+    await bufferToDisk({ kind: 'append', row });
     return { row_url: null };
   }
+  const env = getEnv();
+  const now = new Date().toISOString();
+  const values = [now, row.lead_id, row.email, row.domain, 'processing', '', '', '', '', '', '', '', '', '', '', '', '', ''];
   try {
-    await sheets.spreadsheets.values.append({
-      spreadsheetId: env.GOOGLE_SHEETS_ID!,
-      range: `${env.GOOGLE_SHEETS_TAB}!A:R`,
-      valueInputOption: 'RAW',
-      insertDataOption: 'INSERT_ROWS',
-      requestBody: { values: [values] },
-    });
+    const res = await sheetsApi(
+      'POST',
+      `/values/${encodeURIComponent(env.GOOGLE_SHEETS_TAB)}!A:R:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`,
+      { values: [values] },
+    );
+    if (!res || !res.ok) {
+      log().warn({ status: res?.status }, 'sheets_append_failed');
+      await bufferToDisk({ kind: 'append', row: values });
+      return { row_url: null };
+    }
     return { row_url: `https://docs.google.com/spreadsheets/d/${env.GOOGLE_SHEETS_ID}/edit#gid=0` };
   } catch (err) {
     log().warn({ err }, 'sheets_append_failed');
@@ -154,7 +204,6 @@ export async function appendInitial(row: InitialRow): Promise<{ row_url: string 
 }
 
 export async function updateFinal(row: FinalRow): Promise<void> {
-  const sheets = getSheets();
   const env = getEnv();
   const values = [
     new Date().toISOString(),
@@ -176,33 +225,32 @@ export async function updateFinal(row: FinalRow): Promise<void> {
     row.duration_ms,
     JSON.stringify(row.token_usage),
   ];
-  if (!sheets) {
+  if (!isConfigured()) {
     await bufferToDisk({ kind: 'update', row: values });
     return;
   }
   try {
-    const found = await sheets.spreadsheets.values.get({
-      spreadsheetId: env.GOOGLE_SHEETS_ID!,
-      range: `${env.GOOGLE_SHEETS_TAB}!B:B`,
-    });
-    const rows = found.data.values ?? [];
+    const found = await sheetsApi('GET', `/values/${encodeURIComponent(env.GOOGLE_SHEETS_TAB)}!B:B`);
+    if (!found || !found.ok) {
+      await bufferToDisk({ kind: 'update', row: values });
+      return;
+    }
+    const json = (await found.json()) as { values?: string[][] };
+    const rows = json.values ?? [];
     const idx = rows.findIndex((r) => r[0] === row.lead_id);
     if (idx >= 0) {
       const sheetRow = idx + 1;
-      await sheets.spreadsheets.values.update({
-        spreadsheetId: env.GOOGLE_SHEETS_ID!,
-        range: `${env.GOOGLE_SHEETS_TAB}!A${sheetRow}:R${sheetRow}`,
-        valueInputOption: 'RAW',
-        requestBody: { values: [values] },
-      });
+      await sheetsApi(
+        'PUT',
+        `/values/${encodeURIComponent(env.GOOGLE_SHEETS_TAB)}!A${sheetRow}:R${sheetRow}?valueInputOption=RAW`,
+        { values: [values] },
+      );
     } else {
-      await sheets.spreadsheets.values.append({
-        spreadsheetId: env.GOOGLE_SHEETS_ID!,
-        range: `${env.GOOGLE_SHEETS_TAB}!A:R`,
-        valueInputOption: 'RAW',
-        insertDataOption: 'INSERT_ROWS',
-        requestBody: { values: [values] },
-      });
+      await sheetsApi(
+        'POST',
+        `/values/${encodeURIComponent(env.GOOGLE_SHEETS_TAB)}!A:R:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`,
+        { values: [values] },
+      );
     }
   } catch (err) {
     log().error({ err }, 'sheets_update_failed');
@@ -211,17 +259,14 @@ export async function updateFinal(row: FinalRow): Promise<void> {
 }
 
 export async function findByLeadId(lead_id: string): Promise<string[] | null> {
-  const sheets = getSheets();
+  if (!isConfigured()) return null;
   const env = getEnv();
-  if (!sheets) return null;
   try {
-    const res = await sheets.spreadsheets.values.get({
-      spreadsheetId: env.GOOGLE_SHEETS_ID!,
-      range: `${env.GOOGLE_SHEETS_TAB}!A:R`,
-    });
-    const rows = res.data.values ?? [];
-    const found = rows.find((r) => r[1] === lead_id);
-    return found ?? null;
+    const res = await sheetsApi('GET', `/values/${encodeURIComponent(env.GOOGLE_SHEETS_TAB)}!A:R`);
+    if (!res || !res.ok) return null;
+    const json = (await res.json()) as { values?: string[][] };
+    const rows = json.values ?? [];
+    return rows.find((r) => r[1] === lead_id) ?? null;
   } catch (err) {
     log().warn({ err }, 'sheets_lookup_failed');
     return null;
