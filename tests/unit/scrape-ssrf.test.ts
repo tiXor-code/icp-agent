@@ -1,7 +1,9 @@
-import { describe, it, expect } from 'vitest';
+import { afterAll, beforeAll, describe, it, expect } from 'vitest';
+import http from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { scrape, _ssrf } from '../../src/agent/tools/scrape.js';
 
-const { ipIsBlocked, assertPublicTarget } = _ssrf;
+const { ipIsBlocked, assertPublicTarget, pinnedGet } = _ssrf;
 
 describe('SSRF guard: ipIsBlocked', () => {
   it('blocks loopback, private, link-local and reserved IPv4 ranges', () => {
@@ -47,8 +49,46 @@ describe('SSRF guard: assertPublicTarget', () => {
     await expect(assertPublicTarget(new URL('http://[::1]/'))).rejects.toThrow('blocked_private_target');
   });
 
-  it('allows a public IP literal without a network call', async () => {
-    await expect(assertPublicTarget(new URL('https://8.8.8.8/'))).resolves.toBeUndefined();
+  it('pins a public IP literal to itself without a network call', async () => {
+    await expect(assertPublicTarget(new URL('https://8.8.8.8/'))).resolves.toEqual({ address: '8.8.8.8', family: 4 });
+  });
+});
+
+// Regression for the DNS-rebinding TOCTOU: assertPublicTarget validates an IP,
+// then the outbound connection must go to THAT pinned IP — never a second
+// resolution that an attacker's DNS could rebind to an internal address.
+describe('SSRF guard: pinnedGet connects to the validated IP, never re-resolves', () => {
+  let server: http.Server;
+  let port: number;
+
+  beforeAll(async () => {
+    server = http.createServer((req, res) => {
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      res.end(`served-to-host:${req.headers.host}`);
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    port = (server.address() as AddressInfo).port;
+  });
+
+  afterAll(async () => {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+
+  it('reaches the pinned address even though the URL host resolves elsewhere', async () => {
+    // Host is a public name whose real DNS points nowhere near this test server.
+    // Because the connection is pinned to 127.0.0.1, it lands on our server and
+    // the Host header still carries the original hostname (SNI/vhost preserved).
+    const url = new URL(`http://example.com:${port}/`);
+    const res = await pinnedGet(url, { address: '127.0.0.1', family: 4 }, new AbortController().signal);
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe(`served-to-host:example.com:${port}`);
+  });
+
+  it('honours an already-aborted signal instead of connecting', async () => {
+    const ac = new AbortController();
+    ac.abort();
+    const url = new URL(`http://example.com:${port}/`);
+    await expect(pinnedGet(url, { address: '127.0.0.1', family: 4 }, ac.signal)).rejects.toThrow(/abort/i);
   });
 });
 
