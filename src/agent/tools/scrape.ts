@@ -1,3 +1,5 @@
+import net from 'node:net';
+import { lookup } from 'node:dns/promises';
 import * as cheerio from 'cheerio';
 import type { ScrapeResult } from '../../types.js';
 
@@ -35,21 +37,109 @@ function normalizeDomain(domain: string): string {
   return domain.trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '');
 }
 
+// --- SSRF guard ---------------------------------------------------------
+// The scrape target is attacker-influenced (it comes from the inbound webhook
+// domain), so the outbound fetch must never reach private/internal hosts —
+// directly, via a DNS record pointed at an internal IP, or via a redirect.
+
+const MAX_REDIRECTS = 5;
+
+// Private / loopback / link-local / reserved ranges that must never be fetched.
+const PRIVATE_IP_BLOCKLIST = new net.BlockList();
+for (const [addr, prefix] of [
+  ['0.0.0.0', 8], // "this" network / 0.0.0.0
+  ['10.0.0.0', 8], // RFC1918 private
+  ['100.64.0.0', 10], // CGNAT
+  ['127.0.0.0', 8], // loopback
+  ['169.254.0.0', 16], // link-local incl. cloud metadata 169.254.169.254
+  ['172.16.0.0', 12], // RFC1918 private
+  ['192.0.0.0', 24], // IETF protocol assignments
+  ['192.168.0.0', 16], // RFC1918 private
+  ['198.18.0.0', 15], // benchmarking
+  ['224.0.0.0', 4], // multicast
+  ['240.0.0.0', 4], // reserved
+] as const) {
+  PRIVATE_IP_BLOCKLIST.addSubnet(addr, prefix, 'ipv4');
+}
+PRIVATE_IP_BLOCKLIST.addAddress('::1', 'ipv6'); // loopback
+PRIVATE_IP_BLOCKLIST.addAddress('::', 'ipv6'); // unspecified
+PRIVATE_IP_BLOCKLIST.addSubnet('fc00::', 7, 'ipv6'); // unique local
+PRIVATE_IP_BLOCKLIST.addSubnet('fe80::', 10, 'ipv6'); // link-local
+
+function ipIsBlocked(ip: string): boolean {
+  const kind = net.isIP(ip);
+  if (kind === 0) return true; // not a parseable IP — refuse
+  if (kind === 4) return PRIVATE_IP_BLOCKLIST.check(ip, 'ipv4');
+  // Unwrap IPv4-mapped IPv6 (e.g. ::ffff:169.254.169.254) and re-check as IPv4.
+  const mapped = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i.exec(ip);
+  if (mapped && mapped[1]) return ipIsBlocked(mapped[1]);
+  return PRIVATE_IP_BLOCKLIST.check(ip, 'ipv6');
+}
+
+/**
+ * Reject SSRF targets: only http(s), and every IP the host resolves to must be
+ * publicly routable. Throws when the target is disallowed.
+ */
+async function assertPublicTarget(target: URL): Promise<void> {
+  if (target.protocol !== 'https:' && target.protocol !== 'http:') {
+    throw new Error('blocked_scheme');
+  }
+  const host = target.hostname.replace(/^\[|\]$/g, '');
+  if (net.isIP(host)) {
+    if (ipIsBlocked(host)) throw new Error('blocked_private_target');
+    return;
+  }
+  const resolved = await lookup(host, { all: true });
+  if (resolved.length === 0) throw new Error('dns_no_records');
+  for (const { address } of resolved) {
+    if (ipIsBlocked(address)) throw new Error('blocked_private_target');
+  }
+}
+
+/**
+ * GET a URL while re-validating every hop against the SSRF policy. Redirects are
+ * followed manually (undici's automatic follow would skip per-hop validation and
+ * allow a public host to bounce into an internal one).
+ */
+async function safeGet(startUrl: string, signal: AbortSignal): Promise<Response> {
+  let current = new URL(startUrl);
+  for (let hop = 0; ; hop++) {
+    await assertPublicTarget(current);
+    const res = await fetch(current, {
+      method: 'GET',
+      signal,
+      redirect: 'manual',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (icp-agent/1.0)',
+        Accept: 'text/html,application/xhtml+xml',
+      },
+    });
+    if (res.status >= 300 && res.status < 400) {
+      const location = res.headers.get('location');
+      if (!location) return res;
+      if (hop >= MAX_REDIRECTS) throw new Error('too_many_redirects');
+      const next = new URL(location, current);
+      if (current.protocol === 'https:' && next.protocol === 'http:') {
+        throw new Error('blocked_scheme_downgrade');
+      }
+      // Drain the redirect body so the socket can be reused.
+      await res.arrayBuffer().catch(() => undefined);
+      current = next;
+      continue;
+    }
+    return res;
+  }
+}
+
+export const _ssrf = { ipIsBlocked, assertPublicTarget };
+
 export async function scrape(domain: string): Promise<ScrapeResult> {
   const host = normalizeDomain(domain);
   const url = `https://${host}/`;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 12_000);
   try {
-    const res = await fetch(url, {
-      method: 'GET',
-      signal: controller.signal,
-      redirect: 'follow',
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (icp-agent/1.0)',
-        Accept: 'text/html,application/xhtml+xml',
-      },
-    });
+    const res = await safeGet(url, controller.signal);
     const html = await res.text();
     if (!res.ok) {
       return {
