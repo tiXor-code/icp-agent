@@ -1,3 +1,4 @@
+import { timingSafeEqual } from 'node:crypto';
 import { Hono } from 'hono';
 import { waitUntil } from '@vercel/functions';
 import { WebhookBodySchema } from '../agent/schemas.js';
@@ -10,12 +11,29 @@ import { runAgent } from '../agent/run.js';
 
 const app = new Hono();
 
+/** Constant-time secret comparison to avoid leaking the secret via timing. */
+function secretsMatch(provided: string, expected: string): boolean {
+  const a = Buffer.from(provided);
+  const b = Buffer.from(expected);
+  if (a.length !== b.length) return false;
+  return timingSafeEqual(a, b);
+}
+
 app.post('/', async (c) => {
   const env = getEnv();
 
-  if (env.WEBHOOK_SECRET) {
+  // Fail closed: this endpoint triggers an authenticated-only outbound fetch +
+  // enrichment pipeline. In production the secret is mandatory — an unset secret
+  // must deny, never wave requests through.
+  if (!env.WEBHOOK_SECRET) {
+    if (env.NODE_ENV === 'production') {
+      log().error('webhook_secret_unset_in_production');
+      return c.json({ error: 'server_misconfigured' }, 503);
+    }
+    // Non-production (dev/test) convenience: allow unauthenticated calls locally.
+  } else {
     const got = c.req.header('x-webhook-secret');
-    if (got !== env.WEBHOOK_SECRET) {
+    if (!got || !secretsMatch(got, env.WEBHOOK_SECRET)) {
       return c.json({ error: 'unauthorized' }, 401);
     }
   }
